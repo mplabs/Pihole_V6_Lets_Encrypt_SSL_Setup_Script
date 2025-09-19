@@ -1,28 +1,38 @@
 #!/usr/bin/env bash
-set -e
+# Pi-hole v6 HTTPS with acme.sh (DNS-01) — Debian 13 "Trixie" compatible
+# - Supports Cloudflare, Namecheap, GoDaddy, AWS Route53, DigitalOcean, Linode, Google Cloud DNS, deSEC
+# - Issues ECDSA (P-256) certs with Let's Encrypt via acme.sh
+# - Installs PEM (fullchain + key) to Pi-hole v6 embedded web server (no lighttpd)
+# - Configures pihole-FTL to use your domain, TLS cert, and listen on 443 (TLS)
+# - If a cert already exists, this script forces renewal and reinstall
+#
+# Requirements beforehand:
+#   sudo apt update && sudo apt install -y curl cron socat coreutils
+#   # Optional for Docker-managed Pi-hole path:
+#   sudo apt install -y docker.io
+#
+# Notes:
+# - Pi-hole v6 uses /etc/pihole/pihole.toml and an embedded web server in FTL.
+# - TLS PEM must contain both the certificate chain AND the private key (fullchain + key).
+# - For Docker, this script can copy the PEM into the container and reload it.
 
-# Display information about the script
-echo "=== Pi-hole HTTPS Setup Script ==="
-echo "This script sets up HTTPS for Pi-hole using acme.sh"
-echo "Supported DNS providers: Cloudflare, Namecheap, GoDaddy, AWS Route53, DigitalOcean, Linode, Google Cloud DNS, deSEC"
-echo "Supports both bare metal and Docker installations"
+set -euo pipefail
 
-# Detect if running in a Docker environment
-IN_DOCKER=false
-DOCKER_PIHOLE_NAME=""
-if command -v docker &> /dev/null; then
-  read -p "Are you running Pi-hole in Docker? (y/n): " docker_answer
-  if [[ "${docker_answer}" =~ ^[Yy]$ ]]; then
-    IN_DOCKER=true
-    read -p "Enter your Pi-hole container name (default: pihole): " container_input
-    DOCKER_PIHOLE_NAME=${container_input:-pihole}
-    echo "Using Docker container: ${DOCKER_PIHOLE_NAME}"
-  fi
-fi
+# ---------- Helpers ----------
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Error: required command '$1' not found."; exit 1; }; }
+in_path()  { command -v "$1" >/dev/null 2>&1; }
 
-# Prompt for domain, email, and DNS provider
-read -p "Enter the domain/subdomain (e.g., ns1.mydomain.com): " DOMAIN
-read -p "Enter your email (used for ACME): " ACME_EMAIL
+need_cmd curl
+need_cmd tee
+need_cmd sed
+need_cmd awk
+
+# ---------- Prompts ----------
+read -r -p "Enter the domain/subdomain (e.g., ns1.mydomain.com): " DOMAIN
+if [[ -z "${DOMAIN}" ]]; then echo "Domain is required."; exit 1; fi
+
+read -r -p "Enter your email (used for ACME): " ACME_EMAIL
+if [[ -z "${ACME_EMAIL}" ]]; then echo "ACME email is required."; exit 1; fi
 
 echo ""
 echo "Choose DNS provider:"
@@ -34,208 +44,262 @@ echo "5) DigitalOcean"
 echo "6) Linode"
 echo "7) Google Cloud DNS"
 echo "8) deSEC"
-read -p "Enter your choice (1-7): " DNS_PROVIDER
+read -r -p "Enter your choice (1-8): " DNS_PROVIDER
 
-# Set up DNS validation credentials based on provider
+# ---------- Provider setup ----------
+DNS_METHOD=""
 case "$DNS_PROVIDER" in
   1)
-    # Cloudflare setup
-    read -p "Enter your Cloudflare API token: " CF_Token
+    # Cloudflare (token with Zone:DNS Edit on the zone)
+    read -r -p "Enter your Cloudflare API token: " CF_Token
     export CF_Token="${CF_Token}"
-    export CF_Email="${ACME_EMAIL}"
+    export CF_Email="${ACME_EMAIL}"   # optional with token auth; harmless if present
     DNS_METHOD="dns_cf"
     ;;
-    
   2)
-    # Namecheap setup
-    read -p "Enter your Namecheap username: " NAMECHEAP_USERNAME
-    read -p "Enter your Namecheap API key: " NAMECHEAP_API_KEY
-    read -p "Enter your Namecheap source IP (or press Enter for current IP): " NAMECHEAP_SOURCEIP
-    
-    if [ -z "$NAMECHEAP_SOURCEIP" ]; then
-      NAMECHEAP_SOURCEIP=$(curl -s https://api.ipify.org)
+    # Namecheap (case-sensitive env names)
+    read -r -p "Enter your Namecheap username: " NAMECHEAP_USERNAME
+    read -r -p "Enter your Namecheap API key: " NAMECHEAP_API_KEY
+    read -r -p "Enter your Namecheap source IP (or press Enter for current IP): " NAMECHEAP_SOURCEIP
+    if [ -z "${NAMECHEAP_SOURCEIP}" ]; then
+      NAMECHEAP_SOURCEIP="$(curl -s https://api.ipify.org)"
       echo "Using current IP: ${NAMECHEAP_SOURCEIP}"
     fi
-    
     export Namecheap_Username="${NAMECHEAP_USERNAME}"
-    export Namecheap_API_Key="${NAMECHEAP_API_KEY}"
-    export Namecheap_Sourceip="${NAMECHEAP_SOURCEIP}"
+    export Namecheap_APIKey="${NAMECHEAP_API_KEY}"
+    export Namecheap_SourceIP="${NAMECHEAP_SOURCEIP}"
     DNS_METHOD="dns_namecheap"
     ;;
-    
   3)
-    # GoDaddy setup
-    read -p "Enter your GoDaddy API key: " GODADDY_API_KEY
-    read -p "Enter your GoDaddy API secret: " GODADDY_API_SECRET
-    
+    # GoDaddy
+    read -r -p "Enter your GoDaddy API key: " GODADDY_API_KEY
+    read -r -p "Enter your GoDaddy API secret: " GODADDY_API_SECRET
     export GD_Key="${GODADDY_API_KEY}"
     export GD_Secret="${GODADDY_API_SECRET}"
     DNS_METHOD="dns_gd"
     ;;
-    
   4)
-    # AWS Route53 setup
-    echo "For AWS Route53, you have two authentication options:"
-    echo "1) AWS Access Key ID and Secret Access Key"
-    echo "2) Use AWS credentials file (~/.aws/credentials)"
-    read -p "Choose authentication method (1 or 2): " AWS_AUTH_METHOD
-    
-    if [ "$AWS_AUTH_METHOD" = "1" ]; then
-      read -p "Enter your AWS Access Key ID: " AWS_ACCESS_KEY_ID
-      read -p "Enter your AWS Secret Access Key: " AWS_SECRET_ACCESS_KEY
-      read -p "Enter your AWS region (default: us-east-1): " AWS_REGION
+    # AWS Route53
+    echo "For AWS Route53, choose authentication:"
+    echo "1) Enter Access Key and Secret now"
+    echo "2) Use ~/.aws/credentials or instance profile"
+    read -r -p "Choose authentication method (1 or 2): " AWS_AUTH_METHOD
+    if [ "${AWS_AUTH_METHOD}" = "1" ]; then
+      read -r -p "Enter your AWS Access Key ID: " AWS_ACCESS_KEY_ID
+      read -r -p "Enter your AWS Secret Access Key: " AWS_SECRET_ACCESS_KEY
+      read -r -p "Enter your AWS region (default: us-east-1): " AWS_REGION
       AWS_REGION=${AWS_REGION:-us-east-1}
-      
-      export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
-      export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
+      export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
       export AWS_DEFAULT_REGION="${AWS_REGION}"
     else
-      echo "Using existing AWS credentials from ~/.aws/credentials"
-      # Check if aws credentials file exists
-      if [ ! -f ~/.aws/credentials ]; then
-        echo "Warning: AWS credentials file not found. Please ensure AWS CLI is configured."
+      echo "Using existing AWS credentials from ~/.aws/credentials or instance profile."
+      if [ ! -f "${HOME}/.aws/credentials" ]; then
+        echo "Warning: ~/.aws/credentials not found. Ensure IAM role/profile has Route53 permissions."
       fi
     fi
     DNS_METHOD="dns_aws"
     ;;
-    
   5)
-    # DigitalOcean setup
-    read -p "Enter your DigitalOcean API token: " DO_API_TOKEN
-    
+    # DigitalOcean
+    read -r -p "Enter your DigitalOcean API token: " DO_API_TOKEN
     export DO_API_KEY="${DO_API_TOKEN}"
     DNS_METHOD="dns_dgon"
     ;;
-    
   6)
-    # Linode setup
-    read -p "Enter your Linode API token: " LINODE_API_TOKEN
-    
+    # Linode
+    read -r -p "Enter your Linode API token: " LINODE_API_TOKEN
     export LINODE_V4_API_KEY="${LINODE_API_TOKEN}"
     DNS_METHOD="dns_linode"
     ;;
-    
   7)
-    # Google Cloud DNS setup
-    echo "For Google Cloud DNS, you need a service account key file (JSON)"
-    read -p "Enter the path to your service account JSON key file: " GCP_KEY_FILE
-    
+    # Google Cloud DNS
+    echo "For Google Cloud DNS, you need a service account key file (JSON)."
+    read -r -p "Enter the path to your service account JSON key file: " GCP_KEY_FILE
     if [ ! -f "$GCP_KEY_FILE" ]; then
       echo "Error: Service account key file not found at $GCP_KEY_FILE"
       exit 1
     fi
-    
+    read -r -p "Enter your GCP Project ID: " GCP_PROJECT
+    if [[ -z "${GCP_PROJECT}" ]]; then echo "GCP Project ID is required for dns_gcloud."; exit 1; fi
     export GCE_SERVICE_ACCOUNT_FILE="${GCP_KEY_FILE}"
+    export GCE_PROJECT="${GCP_PROJECT}"
+    export GOOGLE_APPLICATION_CREDENTIALS="${GCP_KEY_FILE}"
     DNS_METHOD="dns_gcloud"
     ;;
-
   8)
     # deSEC
-    read -p "Enter your deSEC API token: " DESEC_API_TOKEN
-    
-    export DEDYN_TOKEN="${DESEC_API_TOKEN}"
+    read -r -p "Enter your deSEC API token: " DESEC_API_TOKEN
+    export DESEC_TOKEN="${DESEC_API_TOKEN}"
     DNS_METHOD="dns_desec"
     ;;
-    
   *)
     echo "Invalid DNS provider selected. Exiting."
     exit 1
     ;;
 esac
 
-# If script runs as root, use /root/.acme.sh; otherwise, use ~/.acme.sh
+# ---------- Paths & acme.sh install ----------
 if [ "$(id -u)" = "0" ]; then
   ACME_HOME="/root/.acme.sh"
 else
   ACME_HOME="${HOME}/.acme.sh"
 fi
-
 ACME_BIN="${ACME_HOME}/acme.sh"
 
-# 1. Install acme.sh if missing
 if [ ! -f "${ACME_BIN}" ]; then
   echo "acme.sh not found. Installing to ${ACME_HOME}..."
+  for c in cron socat; do
+    if ! in_path "$c"; then
+      echo "Warning: '$c' not found. Install it first: sudo apt install -y $c"
+    fi
+  done
   curl https://get.acme.sh | sh -s email="${ACME_EMAIL}"
 else
   echo "acme.sh is already installed at ${ACME_BIN}."
 fi
 
-# 2. Issue certificate using absolute path
-echo "=== Checking acme.sh version ==="
+echo "=== acme.sh version ==="
 "${ACME_BIN}" --version
 
-echo "=== Issuing certificate for '${DOMAIN}' ==="
-"${ACME_BIN}" --issue \
-  --dns ${DNS_METHOD} \
-  -d "${DOMAIN}" \
-  --server letsencrypt \
-  --keylength ec-256
-
-# Certificate paths
+# ---------- Determine issuance vs forced renewal ----------
 CERT_PATH="${ACME_HOME}/${DOMAIN}_ecc"
-KEY_FILE="${CERT_PATH}/${DOMAIN}.key" 
-CERT_FILE="${CERT_PATH}/${DOMAIN}.cer"
+KEY_FILE="${CERT_PATH}/${DOMAIN}.key"
+FULLCHAIN_FILE="${CERT_PATH}/fullchain.cer"
 COMBINED_CERT="/tmp/tls.pem"
 
-# Combine key and certificate
-cat "${KEY_FILE}" "${CERT_FILE}" > "${COMBINED_CERT}"
+echo "=== Preparing certificate for '${DOMAIN}' via ${DNS_METHOD} ==="
+"${ACME_BIN}" --set-default-ca --server letsencrypt
 
-# 3. Install certificate into Pi-hole (with Docker support)
-echo "=== Installing certificate for '${DOMAIN}' into Pi-hole ==="
-
-if [ "$IN_DOCKER" = true ]; then
-  # Docker installation approach
-  echo "Installing certificate for Docker Pi-hole..."
-  
-  # Copy the combined certificate to the Docker container
-  docker cp "${COMBINED_CERT}" "${DOCKER_PIHOLE_NAME}:/etc/pihole/tls.pem"
-  
-  # Configure the domain and restart FTL service inside container
-  docker exec "${DOCKER_PIHOLE_NAME}" pihole-FTL --config webserver.domain "${DOMAIN}"
-  docker exec "${DOCKER_PIHOLE_NAME}" service pihole-FTL restart
-  
-  # Set up auto-renewal hook
-  "${ACME_BIN}" --install-cert -d "${DOMAIN}" \
-    --reloadcmd "cat ${KEY_FILE} ${CERT_FILE} > ${COMBINED_CERT} && \
-    docker cp ${COMBINED_CERT} ${DOCKER_PIHOLE_NAME}:/etc/pihole/tls.pem && \
-    docker exec ${DOCKER_PIHOLE_NAME} service pihole-FTL restart"
+if [ -d "${CERT_PATH}" ]; then
+  echo "Existing certificate directory detected at ${CERT_PATH}."
+  echo "Forcing renewal and reinstall..."
+  "${ACME_BIN}" --renew -d "${DOMAIN}" --force || true
 else
-  # Traditional installation
-  "${ACME_BIN}" --install-cert -d "${DOMAIN}" \
-    --reloadcmd "sudo rm -f /etc/pihole/tls* && \
-    sudo cat ${KEY_FILE} ${CERT_FILE} | sudo tee /etc/pihole/tls.pem && \
-    sudo service pihole-FTL restart"
-    
-  # Configure Pi-hole domain setting
-  echo "=== Configuring Pi-hole to serve HTTPS for domain '${DOMAIN}' ==="
-  sudo pihole-FTL --config webserver.domain "${DOMAIN}"
-  sudo service pihole-FTL restart
+  echo "No existing certificate found. Issuing a new certificate..."
+  "${ACME_BIN}" --issue \
+    --dns "${DNS_METHOD}" \
+    -d "${DOMAIN}" \
+    --server letsencrypt \
+    --keylength ec-256
 fi
 
-# Clean up temporary files
+# Validate files after (re)issuance
+if [ ! -f "${KEY_FILE}" ] || [ ! -f "${FULLCHAIN_FILE}" ]; then
+  echo "Error: expected cert files not found. KEY: ${KEY_FILE}, FULLCHAIN: ${FULLCHAIN_FILE}"
+  exit 1
+fi
+
+# Build PEM as CERT first, then KEY (embedded server accepts PEM with both)
+cat "${FULLCHAIN_FILE}" "${KEY_FILE}" > "${COMBINED_CERT}"
+
+# ---------- Pi-hole deployment mode ----------
+echo ""
+echo "Where is your Pi-hole running?"
+echo "1) Bare-metal / VM (pihole-FTL on the host)"
+echo "2) Docker container"
+read -r -p "Enter your choice (1-2): " PH_MODE
+
+IN_DOCKER=false
+DOCKER_PIHOLE_NAME="pihole"
+TARGET_CERT_PATH_HOST="/etc/pihole/tls.pem"
+TARGET_CERT_PATH_DOCKER="/etc/pihole/tls.pem"
+
+if [ "${PH_MODE}" = "2" ]; then
+  IN_DOCKER=true
+  need_cmd docker
+  read -r -p "Enter your Docker Pi-hole container name (default: pihole): " _cn
+  DOCKER_PIHOLE_NAME="${_cn:-pihole}"
+  read -r -p "Path inside container for PEM (default: /etc/pihole/tls.pem): " _tp
+  TARGET_CERT_PATH_DOCKER="${_tp:-/etc/pihole/tls.pem}"
+fi
+
+# ---------- Functions for configuring FTL webserver ----------
+set_ftl_config() {
+  # Usage: set_ftl_config key value
+  local key="$1"
+  local value="$2"
+  sudo pihole-FTL --config "${key}" "${value}"
+}
+
+ensure_ports_include_tls() {
+  # Explicitly set webserver.port to sane value "80,443s"
+  # (Avoids weird accumulations like "80o,443os,...")
+  set_ftl_config "webserver.port" "80,443s"
+}
+
+# ---------- Install into Pi-hole ----------
+if [ "${IN_DOCKER}" = true ]; then
+  echo "=== Installing certificate into Docker Pi-hole container '${DOCKER_PIHOLE_NAME}' ==="
+  docker cp "${COMBINED_CERT}" "${DOCKER_PIHOLE_NAME}:${TARGET_CERT_PATH_DOCKER}"
+  docker exec "${DOCKER_PIHOLE_NAME}" bash -lc "chmod 600 '${TARGET_CERT_PATH_DOCKER}' || true"
+
+  # Configure domain, PEM path, and TLS port via CLI inside container
+  docker exec "${DOCKER_PIHOLE_NAME}" bash -lc "pihole-FTL --config webserver.domain '${DOMAIN}'"
+  docker exec "${DOCKER_PIHOLE_NAME}" bash -lc "pihole-FTL --config webserver.tls.cert '${TARGET_CERT_PATH_DOCKER}'"
+  docker exec "${DOCKER_PIHOLE_NAME}" bash -lc "pihole-FTL --config webserver.port '80,443s'"
+
+  # Restart container to reload with new TLS
+  docker restart "${DOCKER_PIHOLE_NAME}"
+
+  # Renewal hook for Docker (force reinstall on renew)
+  "${ACME_BIN}" --install-cert -d "${DOMAIN}" --force \
+    --reloadcmd "cat '${FULLCHAIN_FILE}' '${KEY_FILE}' > '${COMBINED_CERT}' && \
+    docker cp '${COMBINED_CERT}' '${DOCKER_PIHOLE_NAME}:${TARGET_CERT_PATH_DOCKER}' && \
+    docker exec '${DOCKER_PIHOLE_NAME}' bash -lc \"chmod 600 '${TARGET_CERT_PATH_DOCKER}' || true; pihole-FTL --config webserver.tls.cert '${TARGET_CERT_PATH_DOCKER}'; pihole-FTL --config webserver.domain '${DOMAIN}'; pihole-FTL --config webserver.port '80,443s'\" && \
+    docker restart '${DOCKER_PIHOLE_NAME}'"
+
+else
+  echo "=== Installing certificate into bare-metal Pi-hole (embedded web server) ==="
+  sudo install -d -m 700 /etc/pihole
+
+  # Write PEM via sudo tee (avoids permission denied from shell redirection)
+  cat "${FULLCHAIN_FILE}" "${KEY_FILE}" | sudo tee /etc/pihole/tls.pem >/dev/null
+  sudo chmod 600 /etc/pihole/tls.pem
+  sudo chown pihole:pihole /etc/pihole/tls.pem || true
+
+  # Configure FTL embedded webserver
+  need_cmd pihole-FTL
+  set_ftl_config "webserver.domain" "${DOMAIN}"
+  set_ftl_config "webserver.tls.cert" "/etc/pihole/tls.pem"
+  ensure_ports_include_tls
+
+  # Restart FTL to pick up TLS
+  if in_path systemctl; then
+    sudo systemctl restart pihole-FTL
+  else
+    sudo service pihole-FTL restart || true
+  fi
+
+  # Renewal hook for bare-metal (force reinstall on renew)
+  "${ACME_BIN}" --install-cert -d "${DOMAIN}" --force \
+    --reloadcmd "cat '${FULLCHAIN_FILE}' '${KEY_FILE}' | sudo tee '/etc/pihole/tls.pem' >/dev/null && \
+    sudo chmod 600 '/etc/pihole/tls.pem' && \
+    sudo chown pihole:pihole '/etc/pihole/tls.pem' || true && \
+    sudo pihole-FTL --config webserver.tls.cert '/etc/pihole/tls.pem' && \
+    sudo pihole-FTL --config webserver.domain '${DOMAIN}' && \
+    sudo pihole-FTL --config webserver.port '80,443s' && \
+    (sudo systemctl restart pihole-FTL 2>/dev/null || sudo service pihole-FTL restart)"
+fi
+
+# Clean up temporary combined cert
 rm -f "${COMBINED_CERT}"
 
-echo "=== Done! Pi-hole should now be serving HTTPS for ${DOMAIN} ==="
-echo "Use '${ACME_BIN} --renew -d ${DOMAIN} --force' to force a renewal."
-
-# Add cron job reminder
-echo ""
-echo "Note: acme.sh has automatically added a cron job to handle renewal."
-echo "You can verify this with: crontab -l"
+echo "=== Done! Pi-hole v6 should now be serving HTTPS for ${DOMAIN} on port 443 ==="
+echo "Try: https://${DOMAIN}/admin/"
+echo "Force-renew now: '${ACME_BIN} --renew -d ${DOMAIN} --force'"
+echo "acme.sh auto-renewal cron is usually installed; check with: crontab -l"
 
 # Provider-specific notes
 case "$DNS_PROVIDER" in
   4)
     echo ""
-    echo "AWS Route53 Note: If you encounter issues with permissions,"
-    echo "ensure your IAM user/role has the following permissions:"
+    echo "AWS Route53 Note: Ensure IAM permissions:"
     echo "  - route53:ListHostedZones"
     echo "  - route53:GetChange"
     echo "  - route53:ChangeResourceRecordSets"
     ;;
   7)
     echo ""
-    echo "Google Cloud DNS Note: Make sure your service account has the"
-    echo "DNS Administrator role or appropriate permissions to create/modify records."
+    echo "Google Cloud DNS Note: Service account needs DNS Admin on project '${GCE_PROJECT}'."
     ;;
 esac
