@@ -82,7 +82,7 @@ We got ‘em all. Well, at least the cool ones:
 
 ## 💻 Installation (aka CTRL+C this stuff)
 ```bash
-curl -O https://raw.githubusercontent.com/PrimePoobah/piholev6-ssl-setup/main/piholev6-ssl-setup.sh
+curl -O https://raw.githubusercontent.com/PrimePoobah/Pihole_V6_Lets_Encrypt_SSL_Setup_Script/refs/piholev6-ssl-setup.sh
 chmod +x piholev6-ssl-setup.sh
 ./piholev6-ssl-setup.sh
 ```
