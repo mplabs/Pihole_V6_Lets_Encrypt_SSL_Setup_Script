@@ -3,7 +3,7 @@
 # - Supports Cloudflare, Namecheap, GoDaddy, AWS Route53, DigitalOcean, Linode, Google Cloud DNS, deSEC
 # - Issues ECDSA (P-256) certs with Let's Encrypt via acme.sh
 # - Installs PEM (fullchain + key) to Pi-hole v6 embedded web server (no lighttpd)
-# - Configures pihole-FTL to use your domain, TLS cert, and listen on 443 (TLS)
+# - Configures pihole-FTL to use your domain, TLS cert, and (optionally) listen on 80/443
 # - If a cert already exists, this script forces renewal and reinstall
 #
 # Requirements beforehand:
@@ -17,6 +17,8 @@
 # - For Docker, this script can copy the PEM into the container and reload it.
 
 set -euo pipefail
+
+CONFIGURE_WEB_PORTS=true
 
 # ---------- Helpers ----------
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Error: required command '$1' not found."; exit 1; }; }
@@ -33,6 +35,14 @@ if [[ -z "${DOMAIN}" ]]; then echo "Domain is required."; exit 1; fi
 
 read -r -p "Enter your email (used for ACME): " ACME_EMAIL
 if [[ -z "${ACME_EMAIL}" ]]; then echo "ACME email is required."; exit 1; fi
+
+read -r -p "Force the Pi-hole web UI to use HTTP 80 and HTTPS 443? (Y/n): " FORCE_WEB_PORTS
+if [[ "${FORCE_WEB_PORTS}" =~ ^[Nn]$ ]]; then
+  CONFIGURE_WEB_PORTS=false
+  echo "Existing Pi-hole webserver.port settings will be left unchanged."
+else
+  echo "Pi-hole webserver.port will be set to 80 (HTTP) and 443 (HTTPS)."
+fi
 
 echo ""
 echo "Choose DNS provider:"
@@ -222,6 +232,10 @@ set_ftl_config() {
 }
 
 ensure_ports_include_tls() {
+  if [ "${CONFIGURE_WEB_PORTS}" != true ]; then
+    echo "Skipping Pi-hole webserver.port changes per user request."
+    return
+  fi
   # Explicitly set webserver.port to sane value "80,443s"
   # (Avoids weird accumulations like "80o,443os,...")
   set_ftl_config "webserver.port" "80,443s"
@@ -236,21 +250,31 @@ if [ "${IN_DOCKER}" = true ]; then
   # Configure domain, PEM path, and TLS port via CLI inside container
   docker exec "${DOCKER_PIHOLE_NAME}" bash -lc "pihole-FTL --config webserver.domain '${DOMAIN}'"
   docker exec "${DOCKER_PIHOLE_NAME}" bash -lc "pihole-FTL --config webserver.tls.cert '${TARGET_CERT_PATH_DOCKER}'"
-  docker exec "${DOCKER_PIHOLE_NAME}" bash -lc "pihole-FTL --config webserver.port '80,443s'"
+  if [ "${CONFIGURE_WEB_PORTS}" = true ]; then
+    docker exec "${DOCKER_PIHOLE_NAME}" bash -lc "pihole-FTL --config webserver.port '80,443s'"
+  fi
 
   # Restart container to reload with new TLS
   docker restart "${DOCKER_PIHOLE_NAME}"
 
   # Renewal hook for Docker (force reinstall on renew)
+  DOCKER_RELOAD_PORT_SNIPPET=""
+  if [ "${CONFIGURE_WEB_PORTS}" = true ]; then
+    DOCKER_RELOAD_PORT_SNIPPET="; pihole-FTL --config webserver.port '80,443s'"
+  fi
   "${ACME_BIN}" --install-cert -d "${DOMAIN}" --force \
     --reloadcmd "cat '${FULLCHAIN_FILE}' '${KEY_FILE}' > '${COMBINED_CERT}' && \
     docker cp '${COMBINED_CERT}' '${DOCKER_PIHOLE_NAME}:${TARGET_CERT_PATH_DOCKER}' && \
-    docker exec '${DOCKER_PIHOLE_NAME}' bash -lc \"chmod 600 '${TARGET_CERT_PATH_DOCKER}' || true; pihole-FTL --config webserver.tls.cert '${TARGET_CERT_PATH_DOCKER}'; pihole-FTL --config webserver.domain '${DOMAIN}'; pihole-FTL --config webserver.port '80,443s'\" && \
+    docker exec '${DOCKER_PIHOLE_NAME}' bash -lc \"chmod 600 '${TARGET_CERT_PATH_DOCKER}' || true; pihole-FTL --config webserver.tls.cert '${TARGET_CERT_PATH_DOCKER}'; pihole-FTL --config webserver.domain '${DOMAIN}'${DOCKER_RELOAD_PORT_SNIPPET}\" && \
     docker restart '${DOCKER_PIHOLE_NAME}'"
 
 else
   echo "=== Installing certificate into bare-metal Pi-hole (embedded web server) ==="
   sudo install -d -m 700 /etc/pihole
+  HOST_RELOAD_PORT_SNIPPET=""
+  if [ "${CONFIGURE_WEB_PORTS}" = true ]; then
+    HOST_RELOAD_PORT_SNIPPET=" && sudo pihole-FTL --config webserver.port '80,443s'"
+  fi
 
   # Write PEM via sudo tee (avoids permission denied from shell redirection)
   cat "${FULLCHAIN_FILE}" "${KEY_FILE}" | sudo tee /etc/pihole/tls.pem >/dev/null
@@ -276,8 +300,7 @@ else
     sudo chmod 600 '/etc/pihole/tls.pem' && \
     sudo chown pihole:pihole '/etc/pihole/tls.pem' || true && \
     sudo pihole-FTL --config webserver.tls.cert '/etc/pihole/tls.pem' && \
-    sudo pihole-FTL --config webserver.domain '${DOMAIN}' && \
-    sudo pihole-FTL --config webserver.port '80,443s' && \
+    sudo pihole-FTL --config webserver.domain '${DOMAIN}'${HOST_RELOAD_PORT_SNIPPET} && \
     (sudo systemctl restart pihole-FTL 2>/dev/null || sudo service pihole-FTL restart)"
 fi
 

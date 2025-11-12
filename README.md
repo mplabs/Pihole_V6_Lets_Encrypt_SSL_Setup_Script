@@ -53,6 +53,7 @@ It works on bare metal, in Docker, and possibly in the Quantum Realm (not tested
 - 🔄 Auto-renewal, because remembering things is for chumps
 - 🔐 ECC certs because... math
 - 🧑‍🎤 Interactive setup wizard that holds your hand like a scared raccoon
+- 🎚️ Optional control over whether the Pi-hole web UI is forced to listen on 80/443
 
 ---
 
@@ -94,12 +95,13 @@ When you run this magnificent beast:
 1. It detects Docker (because it’s psychic)
 2. Asks for your domain (e.g., `pihole.yourcooldomain.com`)
 3. Gets your email (for Let's Encrypt. No spam. Probably.)
-4. Asks which DNS god you worship
-5. Collects your API soul… I mean credentials
-6. Installs `acme.sh` if it’s slacking
-7. Gets your certificate 🎉
-8. Configures Pi-hole to use it
-9. Sets up auto-renewal so you can forget this ever happened
+4. Lets you decide whether it should force the Pi-hole web UI back to ports 80/443
+5. Asks which DNS god you worship
+6. Collects your API soul… I mean credentials
+7. Installs `acme.sh` if it’s slacking
+8. Gets your certificate 🎉
+9. Configures Pi-hole to use it
+10. Sets up auto-renewal so you can forget this ever happened
 
 ---
 
@@ -107,6 +109,7 @@ When you run this magnificent beast:
 No YAML, no BS. It’ll ask you things like:
 - Your domain
 - Your email
+- Whether to reset the Pi-hole web interface ports to 80/443
 - Your DNS provider
 - Your API credentials
 
