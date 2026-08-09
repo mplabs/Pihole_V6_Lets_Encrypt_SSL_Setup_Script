@@ -139,7 +139,10 @@ case "$DNS_PROVIDER" in
   8)
     # deSEC
     read -r -p "Enter your deSEC API token: " DESEC_API_TOKEN
-    export DESEC_TOKEN="${DESEC_API_TOKEN}"
+    # acme.sh's dns_desec plugin historically used DEDYN_TOKEN.
+    # Export both until upstream standardizes on DESEC_TOKEN.
+    export DEDYN_TOKEN="${DESEC_API_TOKEN}"
+    export DEDYN_TOKEN="${DESEC_API_TOKEN}"
     DNS_METHOD="dns_desec"
     ;;
   *)
@@ -149,21 +152,30 @@ case "$DNS_PROVIDER" in
 esac
 
 # ---------- Paths & acme.sh install ----------
-if [ "$(id -u)" = "0" ]; then
-  ACME_HOME="/root/.acme.sh"
-else
-  ACME_HOME="${HOME}/.acme.sh"
+# The renewal hook writes /etc/pihole/tls.pem and restarts pihole-FTL, so it
+# needs root. acme.sh installs its renewal cron for whoever runs this script:
+# run as a normal user and that cron fires without a TTY, every sudo in the
+# hook fails, and the cert silently stops being deployed. Insist on root.
+if [ "$(id -u)" != "0" ]; then
+  echo "Error: run this script as root (e.g. 'sudo -H ./piholev6-ssl-setup.sh')."
+  echo "acme.sh installs its auto-renewal cron for the invoking user, and the"
+  echo "renewal hook needs root to write /etc/pihole/tls.pem and restart pihole-FTL."
+  echo "Running as '$(id -un)' would install a cron that cannot deploy renewals."
+  exit 1
 fi
+ACME_HOME="/root/.acme.sh"
 ACME_BIN="${ACME_HOME}/acme.sh"
 
 if [ ! -f "${ACME_BIN}" ]; then
   echo "acme.sh not found. Installing to ${ACME_HOME}..."
   for c in cron socat; do
     if ! in_path "$c"; then
-      echo "Warning: '$c' not found. Install it first: sudo apt install -y $c"
+      echo "Warning: '$c' not found. Install it first: apt install -y $c"
     fi
   done
-  curl https://get.acme.sh | sh -s email="${ACME_EMAIL}"
+  # --home is explicit: the installer otherwise derives its target from $HOME,
+  # which sudo may leave pointing at the invoking user's home.
+  curl https://get.acme.sh | sh -s -- --home "${ACME_HOME}" --accountemail "${ACME_EMAIL}"
 else
   echo "acme.sh is already installed at ${ACME_BIN}."
 fi
@@ -180,17 +192,25 @@ COMBINED_CERT="/tmp/tls.pem"
 echo "=== Preparing certificate for '${DOMAIN}' via ${DNS_METHOD} ==="
 "${ACME_BIN}" --set-default-ca --server letsencrypt
 
-if [ -d "${CERT_PATH}" ]; then
-  echo "Existing certificate directory detected at ${CERT_PATH}."
+# Test for the cert itself, not the directory: a failed issuance leaves
+# ${CERT_PATH} behind holding only a domain key, and renewing that is an error.
+if [ -f "${FULLCHAIN_FILE}" ]; then
+  echo "Existing certificate detected at ${FULLCHAIN_FILE}."
   echo "Forcing renewal and reinstall..."
-  "${ACME_BIN}" --renew -d "${DOMAIN}" --force || true
+  if ! "${ACME_BIN}" --renew -d "${DOMAIN}" --force; then
+    echo "Error: certificate renewal failed for ${DOMAIN}. Aborting install so an old certificate is not re-deployed."
+    exit 1
+  fi
 else
   echo "No existing certificate found. Issuing a new certificate..."
-  "${ACME_BIN}" --issue \
+  if ! "${ACME_BIN}" --issue \
     --dns "${DNS_METHOD}" \
     -d "${DOMAIN}" \
     --server letsencrypt \
-    --keylength ec-256
+    --keylength ec-256; then
+    echo "Error: certificate issuance failed for ${DOMAIN}. Aborting install."
+    exit 1
+  fi
 fi
 
 # Validate files after (re)issuance
@@ -295,13 +315,18 @@ else
   fi
 
   # Renewal hook for bare-metal (force reinstall on renew)
+  # ponytail: chown is the only tolerated failure; it is braced so `|| true`
+  # cannot swallow a failed write. Without the braces the chain parses as
+  # ((write && chmod && chown) || true) && ... -- a failed write still exits 0,
+  # so acme.sh logs "Reload successful" while FTL keeps serving the old cert.
   "${ACME_BIN}" --install-cert -d "${DOMAIN}" --force \
     --reloadcmd "cat '${FULLCHAIN_FILE}' '${KEY_FILE}' | sudo tee '/etc/pihole/tls.pem' >/dev/null && \
     sudo chmod 600 '/etc/pihole/tls.pem' && \
-    sudo chown pihole:pihole '/etc/pihole/tls.pem' || true && \
+    { sudo chown pihole:pihole '/etc/pihole/tls.pem' || true; } && \
     sudo pihole-FTL --config webserver.tls.cert '/etc/pihole/tls.pem' && \
     sudo pihole-FTL --config webserver.domain '${DOMAIN}'${HOST_RELOAD_PORT_SNIPPET} && \
-    (sudo systemctl restart pihole-FTL 2>/dev/null || sudo service pihole-FTL restart)"
+    (sudo systemctl restart pihole-FTL 2>/dev/null || sudo service pihole-FTL restart) && \
+    cat '${FULLCHAIN_FILE}' '${KEY_FILE}' | sudo cmp -s - /etc/pihole/tls.pem"
 fi
 
 # Clean up temporary combined cert
