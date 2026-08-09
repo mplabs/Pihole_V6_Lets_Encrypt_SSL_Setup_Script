@@ -195,7 +195,7 @@ echo "=== Preparing certificate for '${DOMAIN}' via ${DNS_METHOD} ==="
 if [ -f "${FULLCHAIN_FILE}" ]; then
   echo "Existing certificate detected at ${FULLCHAIN_FILE}."
   echo "Forcing renewal and reinstall..."
-  if ! "${ACME_BIN}" --renew -d "${DOMAIN}" --force; then
+  if ! "${ACME_BIN}" --renew -d "${DOMAIN}" --force --dnssleep 30; then
     echo "Error: certificate renewal failed for ${DOMAIN}. Aborting install so an old certificate is not re-deployed."
     exit 1
   fi
@@ -205,7 +205,8 @@ else
     --dns "${DNS_METHOD}" \
     -d "${DOMAIN}" \
     --server letsencrypt \
-    --keylength ec-256; then
+    --keylength ec-256 \
+    --dnssleep 30; then
     echo "Error: certificate issuance failed for ${DOMAIN}. Aborting install."
     exit 1
   fi
