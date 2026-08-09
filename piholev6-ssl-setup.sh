@@ -139,9 +139,7 @@ case "$DNS_PROVIDER" in
   8)
     # deSEC
     read -r -p "Enter your deSEC API token: " DESEC_API_TOKEN
-    # acme.sh's dns_desec plugin historically used DEDYN_TOKEN.
-    # Export both until upstream standardizes on DESEC_TOKEN.
-    export DEDYN_TOKEN="${DESEC_API_TOKEN}"
+    # acme.sh's dns_desec plugin reads DEDYN_TOKEN, not DESEC_TOKEN.
     export DEDYN_TOKEN="${DESEC_API_TOKEN}"
     DNS_METHOD="dns_desec"
     ;;

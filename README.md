@@ -153,6 +153,8 @@ Manual override?
 ## ❓ Troubleshooting (aka Crap Hit the Fan)
 **Can’t get a cert?**
 - Check your DNS API creds
+- For deSEC, this wrapper exports both `DESEC_TOKEN` and legacy `DEDYN_TOKEN` because current `acme.sh` releases may still expect the old variable name
+- For deSEC, the domain must live inside a zone that actually exists in your deSEC account; `invalid domain` usually means the zone is not hosted there
 - Verify your DNS settings
 - Sacrifice a virtual goat? (not required, but might help)
 
